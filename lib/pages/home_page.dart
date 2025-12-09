@@ -1,9 +1,12 @@
 import 'package:flutter/material.dart';
 import '../models/alarm.dart';
 import '../services/alarm_service.dart';
+import '../services/notification_service.dart';
 import 'add_alarm_page.dart';
 import 'package:audioplayers/audioplayers.dart';
 import 'alarm_ringing_page.dart';
+import 'package:timezone/timezone.dart' as tz;
+import 'debug_page.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -12,7 +15,7 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> {
+class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   final AlarmService _alarmService = AlarmService();
   List<Alarm> alarms = [];
   final AudioPlayer _audioPlayer = AudioPlayer();
@@ -24,7 +27,20 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _loadAlarms();
+    // Ensure background checker is running when app is active
+    BackgroundAlarmChecker().start();
+  }
+  
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    // Restart checker when app comes to foreground
+    if (state == AppLifecycleState.resumed) {
+      print('📱 App resumed - restarting background checker');
+      BackgroundAlarmChecker().start();
+    }
   }
 
   Future<void> _loadAlarms() async {
@@ -32,13 +48,19 @@ class _HomePageState extends State<HomePage> {
     setState(() {
       alarms = loadedAlarms;
     });
+    // Schedule all alarms after loading
+    print('📋 HomePage: Loading ${loadedAlarms.length} alarms, scheduling...');
+    await _alarmService.scheduleAllAlarms(alarms);
+    print('✅ HomePage: All alarms scheduled');
   }
 
-  void _addNewAlarm(Alarm alarm) {
+  void _addNewAlarm(Alarm alarm) async {
     setState(() {
       alarms.add(alarm);
     });
-    _alarmService.saveAlarms(alarms);
+    print('➕ Adding new alarm: ${alarm.label} at ${alarm.time}');
+    await _alarmService.saveAlarms(alarms);
+    print('✅ Alarm added and scheduled');
   }
 
   void _toggleSelection(int index) {
@@ -85,11 +107,13 @@ class _HomePageState extends State<HomePage> {
     });
   }
 
-  void _toggleAlarmActive(int index, bool value) {
+  void _toggleAlarmActive(int index, bool value) async {
     setState(() {
       alarms[index].isActive = value;
     });
-    _alarmService.saveAlarms(alarms);
+    print('🔄 Toggling alarm $index to ${value ? "active" : "inactive"}');
+    await _alarmService.saveAlarms(alarms);
+    print('✅ Alarm toggled and rescheduled');
   }
 
   void _openAddAlarmPage() {
@@ -108,11 +132,13 @@ class _HomePageState extends State<HomePage> {
         builder: (context) => AddAlarmPage(
           existingAlarm: alarms[index], // 👈 Mevcut alarm
           alarmIndex: index, // 👈 Index
-          onAlarmAdded: (alarm) {
+          onAlarmAdded: (alarm) async {
             setState(() {
               alarms[index] = alarm; // 👈 Güncelle
             });
-            _alarmService.saveAlarms(alarms);
+            print('✏️ Editing alarm $index: ${alarm.label} at ${alarm.time}');
+            await _alarmService.saveAlarms(alarms);
+            print('✅ Alarm updated and rescheduled');
           },
         ),
       ),
@@ -128,6 +154,14 @@ class _HomePageState extends State<HomePage> {
       MaterialPageRoute(
         builder: (context) => AlarmRingingPage(alarm: testAlarm),
       ),
+    );
+  }
+
+  void _testNotification() async {
+    final notificationService = NotificationService();
+    await notificationService.testNotification(5);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('🧪 Test notification scheduled for 5 seconds')),
     );
   }
 
@@ -337,7 +371,28 @@ class _HomePageState extends State<HomePage> {
         floatingActionButton: Column(
           mainAxisAlignment: MainAxisAlignment.end,
           children: [
-            // Test butonu 👇
+            // Debug button 👇
+            FloatingActionButton(
+              onPressed: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (context) => DebugPage()),
+                );
+              },
+              backgroundColor: Colors.purple,
+              heroTag: 'debug',
+              child: Icon(Icons.bug_report),
+            ),
+            SizedBox(height: 10),
+            // Test notification button 👇
+            FloatingActionButton(
+              onPressed: _testNotification,
+              backgroundColor: Colors.green,
+              heroTag: 'test_notif',
+              child: Icon(Icons.notifications),
+            ),
+            SizedBox(height: 10),
+            // Test alarm sound button 👇
             FloatingActionButton(
               onPressed: _testAlarmSound,
               backgroundColor: Colors.blue,
@@ -362,7 +417,8 @@ class _HomePageState extends State<HomePage> {
 
   @override
   void dispose() {
-    _audioPlayer.dispose(); // 👈 Ekle
+    WidgetsBinding.instance.removeObserver(this);
+    _audioPlayer.dispose();
     super.dispose();
   }
 }

@@ -3,11 +3,14 @@
 // ============================================
 import 'package:flutter/material.dart';
 import 'package:audioplayers/audioplayers.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:flutter/services.dart';
 import 'dart:async';
 import '../models/alarm.dart';
 import '../services/sound_detector_service.dart';
+import '../services/log_reader.dart';
+import '../services/notification_service.dart';
 import 'debug_log_page.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
 class AlarmRingingPage extends StatefulWidget {
   final Alarm alarm;
@@ -21,15 +24,21 @@ class AlarmRingingPage extends StatefulWidget {
 class _AlarmRingingPageState extends State<AlarmRingingPage> {
   final AudioPlayer _audioPlayer = AudioPlayer();
   final SoundDetectorService _soundDetector = SoundDetectorService();
+  static const platform = MethodChannel('com.example.alarm/audio_stream');
   bool _isListeningForWater = false;
   Timer? _timeoutTimer;
-  List<String> _debugLogs = []; // 👈 Ekle
+  List<String> _debugLogs = [];
 
   @override
   void initState() {
     super.initState();
     _initializeDetector();
     _startAlarm();
+    // Don't stop service immediately - let it play for a moment, then stop
+    // This ensures sound plays even if page takes time to load
+    Future.delayed(Duration(milliseconds: 500), () {
+      NotificationService().stopAlarmService();
+    });
   }
 
   Future<void> _initializeDetector() async {
@@ -46,33 +55,91 @@ class _AlarmRingingPageState extends State<AlarmRingingPage> {
       _timeoutTimer?.cancel();
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
+          const SnackBar(
             content: Text('Water sound detected! ✓'),
             duration: Duration(seconds: 1),
           ),
         );
+        // Navigate back immediately after showing snackbar
+        Future.delayed(Duration(milliseconds: 500), () {
+          _stopAlarm();
+        });
+      } else {
+        _stopAlarm();
       }
-      _stopAlarm();
     };
   }
 
   Future<void> _startAlarm() async {
+    // Set player mode and max volume
+    await _audioPlayer.setPlayerMode(PlayerMode.mediaPlayer);
+    await _audioPlayer.setVolume(1.0); // Max volume
+    
+    // Set audio stream type to ALARM (Android only)
+    try {
+      await platform.invokeMethod('setAudioStreamAlarm');
+    } catch (e) {
+      print('⚠️ Could not set audio stream type: $e');
+    }
+    
     await _audioPlayer.play(AssetSource('sounds/alarm_sound.mp3'));
     await _audioPlayer.setReleaseMode(ReleaseMode.loop);
-    print('🔊 Alarm started');
+    
+    print('🔊 Alarm started at max volume with ALARM stream');
   }
 
   Future<void> _stopAlarm() async {
-    await _audioPlayer.stop();
-    await _soundDetector.stopListening();
+    print('🛑 Stopping alarm and navigating back...');
+    
+    try {
+      // Stop foreground service if running
+      await NotificationService().stopAlarmService();
+      
+      // Stop audio and detector
+      await _audioPlayer.stop();
+      await _soundDetector.stopListening();
 
-    if (mounted) {
-      Navigator.pop(context);
+      // Navigate back to home page
+      if (mounted) {
+        // Use popUntil to go back to home page
+        Navigator.of(context).popUntil((route) => route.isFirst);
+        print('✅ Navigation completed - returned to home page');
+      }
+    } catch (e) {
+      print('❌ Error stopping alarm: $e');
+      // Fallback: just pop once
+      if (mounted) {
+        try {
+          Navigator.of(context).pop();
+          print('✅ Fallback navigation completed');
+        } catch (e2) {
+          print('❌ Error in fallback navigation: $e2');
+        }
+      }
     }
   }
 
   void _startListeningForWater() async {
-    await _audioPlayer.pause();
+    // Request microphone permission first
+    final micPermission = await Permission.microphone.request();
+    if (!micPermission.isGranted) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Microphone permission needed for water detection!'),
+            action: SnackBarAction(
+              label: 'Settings',
+              onPressed: () => openAppSettings(),
+            ),
+          ),
+        );
+      }
+      return;
+    }
+
+    // Stop alarm sound completely (both page and service)
+    await _audioPlayer.stop();
+    await NotificationService().stopAlarmService();
 
     setState(() {
       _isListeningForWater = true;
@@ -80,25 +147,22 @@ class _AlarmRingingPageState extends State<AlarmRingingPage> {
 
     _soundDetector.startListening();
 
-    // SharedPreferences'ten log oku (her 500ms)
-    Timer.periodic(Duration(milliseconds: 500), (timer) async {
+    Timer.periodic(const Duration(seconds: 1), (timer) async {
       if (!_isListeningForWater || !mounted) {
         timer.cancel();
         return;
       }
 
-      final prefs = await SharedPreferences.getInstance();
-      final logs = prefs.getString('logs') ?? '';
-
-      if (logs.isNotEmpty) {
-        setState(() {
-          _debugLogs = logs.split('\n').take(50).toList();
-        });
-      }
+      final logs = await LogReader.getLogs();
+      setState(() {
+        _debugLogs = logs.split('\n').where((l) => l.isNotEmpty).toList();
+      });
     });
 
-    _timeoutTimer = Timer(Duration(seconds: 10), () {
-      // ... timeout
+    _timeoutTimer = Timer(const Duration(seconds: 10), () {
+      if (mounted && _isListeningForWater) {
+        _onTimeout();
+      }
     });
   }
 
@@ -109,12 +173,13 @@ class _AlarmRingingPageState extends State<AlarmRingingPage> {
       _isListeningForWater = false;
     });
 
-    // Alarm sesini tekrar başlat
-    await _audioPlayer.resume();
+    // Resume alarm sound
+    await _audioPlayer.play(AssetSource('sounds/alarm_sound.mp3'));
+    await _audioPlayer.setReleaseMode(ReleaseMode.loop);
 
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
+        const SnackBar(
           content: Text('No water detected. Alarm restarted.'),
           duration: Duration(seconds: 2),
         ),
@@ -123,7 +188,6 @@ class _AlarmRingingPageState extends State<AlarmRingingPage> {
   }
 
   void _onManualStop() {
-    // Test için manuel kapatma
     _timeoutTimer?.cancel();
     _stopAlarm();
   }
@@ -133,67 +197,68 @@ class _AlarmRingingPageState extends State<AlarmRingingPage> {
     return WillPopScope(
       onWillPop: () async => false,
       child: Scaffold(
-        backgroundColor: Color(0xFF1A1A1A),
+        backgroundColor: const Color(0xFF1A1A1A),
         body: SafeArea(
           child: Padding(
-            padding: EdgeInsets.all(24),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Spacer(),
+            padding: const EdgeInsets.all(24),
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  SizedBox(height: 40),
 
-                // Alarm icon
-                Container(
+                  Container(
                   width: 120,
                   height: 120,
                   decoration: BoxDecoration(
-                    color: Color(0xFFB71C1C).withOpacity(0.2),
+                    color: const Color(0xFFB71C1C).withOpacity(0.2),
                     shape: BoxShape.circle,
                   ),
-                  child: Icon(Icons.alarm, size: 60, color: Color(0xFFB71C1C)),
+                  child: const Icon(
+                    Icons.alarm,
+                    size: 60,
+                    color: Color(0xFFB71C1C),
+                  ),
                 ),
 
-                SizedBox(height: 40),
+                const SizedBox(height: 40),
 
-                // Alarm time
                 Text(
                   widget.alarm.getFormattedTime(),
-                  style: TextStyle(
+                  style: const TextStyle(
                     fontSize: 72,
                     fontWeight: FontWeight.w200,
                     letterSpacing: -2,
                   ),
                 ),
 
-                SizedBox(height: 16),
+                const SizedBox(height: 16),
 
-                // Alarm label
                 Text(
                   widget.alarm.label,
                   style: TextStyle(fontSize: 24, color: Colors.grey[400]),
                 ),
 
-                SizedBox(height: 60),
+                const SizedBox(height: 60),
 
-                // Main button: I Hear Water
                 if (!_isListeningForWater)
                   GestureDetector(
                     onTap: _startListeningForWater,
                     child: Container(
                       width: double.infinity,
-                      padding: EdgeInsets.symmetric(vertical: 24),
+                      padding: const EdgeInsets.symmetric(vertical: 24),
                       decoration: BoxDecoration(
-                        color: Color(0xFFB71C1C),
+                        color: const Color(0xFFB71C1C),
                         borderRadius: BorderRadius.circular(16),
                         boxShadow: [
                           BoxShadow(
-                            color: Color(0xFFB71C1C).withOpacity(0.4),
+                            color: const Color(0xFFB71C1C).withOpacity(0.4),
                             blurRadius: 20,
-                            offset: Offset(0, 10),
+                            offset: const Offset(0, 10),
                           ),
                         ],
                       ),
-                      child: Column(
+                      child: const Column(
                         children: [
                           Icon(Icons.water_drop, size: 48, color: Colors.white),
                           SizedBox(height: 12),
@@ -220,13 +285,13 @@ class _AlarmRingingPageState extends State<AlarmRingingPage> {
                 else
                   Container(
                     width: double.infinity,
-                    padding: EdgeInsets.symmetric(vertical: 32),
+                    padding: const EdgeInsets.symmetric(vertical: 32),
                     decoration: BoxDecoration(
                       color: Colors.blue.withOpacity(0.2),
                       borderRadius: BorderRadius.circular(16),
                       border: Border.all(color: Colors.blue, width: 2),
                     ),
-                    child: Column(
+                    child: const Column(
                       children: [
                         SizedBox(
                           width: 60,
@@ -250,18 +315,14 @@ class _AlarmRingingPageState extends State<AlarmRingingPage> {
                         SizedBox(height: 8),
                         Text(
                           'Turn on the faucet',
-                          style: TextStyle(
-                            fontSize: 14,
-                            color: Colors.grey[400],
-                          ),
+                          style: TextStyle(fontSize: 14, color: Colors.grey),
                         ),
                       ],
                     ),
                   ),
 
-                SizedBox(height: 20),
+                const SizedBox(height: 20),
 
-                // Test: Manual close button
                 TextButton(
                   onPressed: _onManualStop,
                   child: Text(
@@ -279,17 +340,16 @@ class _AlarmRingingPageState extends State<AlarmRingingPage> {
                       ),
                     );
                   },
-                  child: Text(
+                  child: const Text(
                     'View Debug Logs',
                     style: TextStyle(color: Colors.blue, fontSize: 12),
                   ),
                 ),
 
-                Spacer(),
+                  SizedBox(height: 40),
 
-                // Info text
-                Container(
-                  padding: EdgeInsets.all(16),
+                  Container(
+                    padding: const EdgeInsets.all(16),
                   decoration: BoxDecoration(
                     color: Colors.grey[900],
                     borderRadius: BorderRadius.circular(12),
@@ -301,7 +361,7 @@ class _AlarmRingingPageState extends State<AlarmRingingPage> {
                         color: Colors.grey[400],
                         size: 20,
                       ),
-                      SizedBox(width: 12),
+                      const SizedBox(width: 12),
                       Expanded(
                         child: Text(
                           'To stop the alarm, go to the bathroom and turn on the faucet.',
@@ -319,6 +379,7 @@ class _AlarmRingingPageState extends State<AlarmRingingPage> {
           ),
         ),
       ),
+    ),
     );
   }
 
