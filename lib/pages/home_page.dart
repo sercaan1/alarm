@@ -2,10 +2,10 @@ import 'package:flutter/material.dart';
 import '../models/alarm.dart';
 import '../services/alarm_service.dart';
 import '../services/notification_service.dart';
+import '../services/background_alarm_checker.dart';
 import 'add_alarm_page.dart';
 import 'package:audioplayers/audioplayers.dart';
 import 'alarm_ringing_page.dart';
-import 'package:timezone/timezone.dart' as tz;
 import 'debug_page.dart';
 
 class HomePage extends StatefulWidget {
